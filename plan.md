@@ -62,7 +62,7 @@ for y in range(H_out):
         I_out[y,x] = bilinear_sample(I_resize, u, v)
 ```
 
-In practice, $map_x$ and $map_y$ are usually generated offline from camera calibration parameters, then reused at runtime. When a fully streaming implementation is required, the remap access pattern must be constrained to a bounded local window so that a small on-chip line buffer can satisfy all 2×2 bilinear neighborhoods without external memory reads. A schedulable output queue defers pixel emission until the required source rows are resident in the buffer, decoupling the map-driven access order from the strict raster output order. An offline map-quality check—measuring per-pixel displacement bounds and buffer hit rate—should be performed before hardware integration to confirm that the chosen buffer depth can sustain target throughput; any miss can be handled via a slow-path DDR fallback to preserve functional correctness.
+In practice, $map_x$ and $map_y$ are usually generated offline from camera calibration parameters, then reused at runtime. As an optimization direction (if schedule permits), we can further constrain remap access to a bounded local window so that a small on-chip line buffer can satisfy most 2×2 bilinear neighborhoods without external memory reads. We can also introduce a schedulable output queue that defers pixel emission until required source rows are resident, decoupling map-driven access from strict raster output order. Before adopting this optimization path, an offline map-quality check (per-pixel displacement bounds and expected buffer hit rate) can be used to estimate feasibility; rare misses may still be handled through a slow-path DDR fallback to preserve functional correctness.
 
 
 
@@ -120,12 +120,12 @@ while stream_resize.not_empty():
 
 The preprocessing can be performed as follows:
 -	PS stores the input frame in shared memory and supplies source and destination buffer addresses to the IP.
--	PS writes control registers for frame size, output size, rectification map addresses, and offline-validated displacement bounds ($D_x$, $D_y$) through AXI4-Lite.
+-	PS writes control registers for frame size, output size, and rectification map addresses through AXI4-Lite (with optional displacement-bound parameters $D_x$, $D_y$ for the advanced streaming optimization).
 -	IP reads image pixels from memory and converts them into an internal AXI4-Stream pixel stream.
 -	A resize module performs coordinate generation and bilinear interpolation to produce a resized pixel stream.
--	The resized stream feeds a line-buffered rectify stage with depth $D_y + 2$ and an output scheduling queue.
--	For each output pixel, rectify reads map_x/map_y, checks whether the requested sample is in the local buffered window, and applies bilinear interpolation from line buffers when it hits.
--	For rare misses outside the local window, rectify uses a slow-path read from the backing store ($I_{resize}$ in DDR) to preserve correctness.
+-	The resized stream feeds the rectify stage. In the baseline design, rectify accesses the resized frame through standard memory reads.
+-	As a time-permitting optimization, rectify can be upgraded to a line-buffered design with depth $D_y + 2$, an output scheduling queue, and local-window hit checks.
+-	In that optimized mode, rare misses outside the local window can use a slow-path read from the backing store ($I_{resize}$ in DDR) to preserve correctness.
 -	A frame output module writes the final processed image to shared memory.
 -	The IP reports completion and optional timing/performance counters back to the PS through status registers.
 
@@ -135,14 +135,14 @@ Reads image data from PS-visible memory and formats it as an AXI4-Stream pixel s
 -	Resize module
 Computes source coordinates for each output pixel and performs bilinear interpolation. This module is parameterized by input and output image dimensions.
 -	Rectify module
-Applies geometric remapping using calibration maps with bounded local displacement. This module contains line buffers, a schedulable output queue, and a local-window hit test; it interpolates from line buffers on hits and uses DDR-backed $I_{resize}$ on misses.
+Applies geometric remapping using calibration maps. Baseline implementation uses standard memory access; if time permits, it can be extended with bounded local displacement, line buffers, a schedulable output queue, and local-window hit testing, with DDR-backed $I_{resize}$ used on misses.
 -	Frame egress module
 Collects the processed pixel stream and writes the result back to shared memory so the PS can access it.
 -	Control / status module
 Exposes configuration registers such as source address, destination address, dimensions, map addresses, displacement bounds ($D_x$, $D_y$), start, done, and optional cycle counters.
 
 The interfaces are chosen as follows:
--	Shared memory is used between PS and IP for input/output frame buffers, rectification maps, and optional backing storage of resized pixels for slow-path misses.
+-	Shared memory is used between PS and IP for input/output frame buffers and rectification maps. Optional backing storage of resized pixels is reserved for the advanced optimized rectify path.
 -	AXI4-Lite is used for configuration and status.
 -	AXI4-Stream is used between internal compute modules for the primary fast path.
 
