@@ -1,0 +1,5 @@
+numpy>=1.26,<2
+Pillow>=10
+
+# Optional: enables the OpenCV cross-check in sw/test_resize.py
+# opencv-python>=4.8

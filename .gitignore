@@ -1,0 +1,10 @@
+# Large legacy / third-party content kept on disk but not tracked.
+archive/
+
+# Vitis HLS build artifacts.
+hls/resize_hls/
+hls/vitis_hls.log
+
+# Python build artifacts.
+__pycache__/
+*.pyc
