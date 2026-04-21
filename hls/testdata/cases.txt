@@ -1,0 +1,5 @@
+nyu_downscale_320x240 288 384 240 320
+nyu_half 288 384 144 192
+nyu_upscale_640x480 288 384 480 640
+nyu_identity 288 384 288 384
+nyu_square_96 288 384 96 96
