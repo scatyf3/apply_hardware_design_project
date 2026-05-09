@@ -1,0 +1,4 @@
+in_h 8
+in_w 8
+out_h 8
+out_w 8

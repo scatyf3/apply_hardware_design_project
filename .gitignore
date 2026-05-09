@@ -8,3 +8,13 @@ hls/vitis_hls.log
 # Python build artifacts.
 __pycache__/
 *.pyc
+# Vitis HLS generated build folders
+hls/rectify_hls/
+hls/resize_hls/
+hls/*_hls/
+
+# Common generated logs
+*.jou
+*.str
+.vivado/
+.Xil/
