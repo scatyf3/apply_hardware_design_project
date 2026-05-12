@@ -101,6 +101,18 @@ def make_pair_png(in_img: np.ndarray, out_img: np.ndarray, path: Path) -> None:
     Image.fromarray(canvas, mode="L").save(path)
 
 
+def overlay_grid(img: np.ndarray, spacing: int = 24, value: int = 255) -> np.ndarray:
+    """Paint a thin regular grid onto a uint8 grayscale image (non-destructive)."""
+    out = img.copy()
+    for x in range(0, out.shape[1], spacing):
+        out[:, x] = value
+    out[:, out.shape[1] - 1] = value
+    for y in range(0, out.shape[0], spacing):
+        out[y, :] = value
+    out[out.shape[0] - 1, :] = value
+    return out
+
+
 def verify_loop_equals_vectorized(in_img, map_x, map_y, out_vec, name):
     """Sanity: rectify() loop and rectify_vectorized() agree byte-for-byte.
 
@@ -162,7 +174,15 @@ def main() -> None:
         out_img.tofile(gold_bin)
 
         pair_png = VIS_DIR / f"{name}_pair.png"
-        make_pair_png(in_img, out_img, pair_png)
+        if kind == "barrel":
+            # Overlay a regular grid on the input and re-run the same map so the
+            # output's bent grid lines make the radial distortion + edge clamp
+            # immediately obvious. .bin fixtures above stay un-gridded.
+            in_viz = overlay_grid(in_img, spacing=24, value=255)
+            out_viz = rectify_vectorized(in_viz, map_x, map_y)
+            make_pair_png(in_viz, out_viz, pair_png)
+        else:
+            make_pair_png(in_img, out_img, pair_png)
 
         manifest_lines.append(f"{name} {in_h} {in_w} {out_h} {out_w}")
         print(

@@ -1,26 +1,48 @@
 # Real-Time ROS 2 Camera Preprocessing Accelerator
 
-Two Vitis HLS image-processing kernels for the AMD ROS 2 Perception Node pipeline: bilinear `resize_kernel` and map-based `rectify_kernel`. Architecture and motivation are in [plan.md](apply_hardware_design_project/plan.md); this README is the build / test / verification reference for both stages.
+This project include two Vitis HLS image-processing kernels for the AMD ROS 2 Perception Node pipeline: bilinear `resize_kernel` and map-based `rectify_kernel`. The motivation is to **offload simple but heavy image processing computation from PS to IP**, thus allow PS to perform real-time downstream perception tasks such as object detection, SLAM, and visual odometry without being bottlenecked by per-pixel preprocessing.
 
-## verification at a glance
+The overall architechture is shown in below figure, demostrating the process for our project
+1. Initialization: 
+    - Step 1: PS compute mapping for `rectify_kernel`, write to memory using AXI-Full
+    - Step 2: PS assign IPs register
+2. Process Loop: after initialize the system, IPs do following loop iteratively
+    - Step 3:  `resize_kernel` read raw data from camera using AXI-Stream and process them
+    - Step 4:  `resize_kernel` us AXI-Stream, write the processed image to DMA IP 
+    - Step 5: DMA write the data to DDR using AXI-Full
+    - Step 6: `rectify_kernel` read/process/write the image using AXI-Full
 
-All results from Vitis HLS 2023.2, target part `xczu7ev-ffvc1156-2-e` (Zynq UltraScale+ ZCU104-class) at a 5 ns clock target.
+![](.asserts/image.png)
 
-| stage | python tests | hls csim | csynth | hls cosim | resources (BRAM / DSP / FF / LUT) |
-|---|---|---|---|---|---|
-| `resize_kernel`  | 5/5 PASS | 5/5 PASS | done; slack `−0.00 ns` (marginal) | 10/10 PASS (5 synthetic + 5 NYU real-data) | 2 / 37 / 5,206 / 6,406 |
-| `rectify_kernel` | 4/4 PASS | 5/5 PASS | done; slack `0.00 ns` (clean)    | 5/5 PASS                                   | 12 / 13 / 7,542 / 8,903 |
+Our IP processed result is shown in this 2 examples
 
-Per-case verification tables, schedule analysis, and resource percentages of the target part are in the respective sections below. Raw HLS reports live under `hls/{resize,rectify}_hls/sol1/syn/report/` and `…/sim/report/`; the build trees are intentionally excluded from version control via `.gitignore` (`hls/*_hls/`) — the tables in this README are the canonical summary.
+Example — `nyu_upscale_640x480` (384×288 input on the left, 640×480 bilinear-upscaled output on the right):
 
-The resize top-module slack of `−0.00 ns` is HLS flagging a sub-rounding timing violation on the `EMIT_PIXEL` pipeline at the 5 ns target. The kernel synthesizes and co-simulates correctly; closing timing in Vivado place-and-route may require a slightly relaxed clock or LUT-area trade. The rectify kernel meets the same 5 ns target with no warning.
+![nyu_upscale_640x480 input | output](sw/vis/nyu_upscale_640x480_pair.png)
 
-## python environment
+Example — `nyu_rectify_barrel_mild` 
+
+![nyu_rectify_barrel_mild input | output (grid overlay)](sw/vis/nyu_rectify_barrel_mild_pair.png)
+
+On PYNQ-Z2 (`xc7z020` @ 100 MHz) the baseline runs at **≈55 fps for 640×480** (resize 6.1 ms + rectify 12.3 ms ≈ 18 ms / frame) and **≈8 fps for 1080p** (41.5 ms + 82.9 ms); per-resolution latency tables live under each kernel's verification & synthesis section below.
+
+## Codebase overview
+
+```shell
+tree -L 1
+.
+├── hls                          # Vitis HLS C++ kernels, testbenches, build scripts
+├── plan.md                      # architecture, motivation, and optimization roadmap
+├── README.md                    # this file (build / test / verification reference)
+├── requirements.txt             # Python dependencies (numpy, Pillow)
+└── sw                           # Python golden model + unit tests + fixture generators
+```
+
+### environments and dataset
 
 The Python side (golden model + real-data fixture generation) only needs `numpy` and `Pillow`, pinned in [apply_hardware_design_project/requirements.txt](apply_hardware_design_project/requirements.txt). Any Python ≥ 3.9 works; tested on 3.10.
 
-**Option A — venv + pip** (no conda needed):
-
+To install the environments: 
 ```
 python3 -m venv .venv
 source .venv/bin/activate            # bash/zsh
@@ -28,26 +50,16 @@ source .venv/bin/activate            # bash/zsh
 pip install -r apply_hardware_design_project/requirements.txt
 ```
 
-**Option B — conda / micromamba**:
-
-```
-micromamba create -n resize python=3.10 numpy pillow
-micromamba activate resize
-```
-
 After activation, all `python …` commands in this README use that interpreter.
 
-OpenCV is optional — [sw/test_resize.py](apply_hardware_design_project/sw/test_resize.py) skips the cv2 cross-check when it's not importable. Enable it by uncommenting the `opencv-python` line in `requirements.txt` (or `pip install opencv-python`).
+We use [nyu_depth_v2](https://cs.nyu.edu/~fergus/datasets/nyu_depth_v2.html) as test data — the 384×288 preprocessed RGB derivative of the NYU V2 labeled split (795 train / 654 test images), stored under [apply_hardware_design_project/archive/data/nyu_real/](apply_hardware_design_project/archive/data/nyu_real/).
 
-## dataset
+### data preprocessing and testcase build
 
-Real-image tests reuse the NYU indoor-scene PNGs already on disk under [apply_hardware_design_project/archive/data/nyu_real/](apply_hardware_design_project/archive/data/nyu_real/) — no download needed:
 
-- `train/images/` — 795 PNGs, **384×288 RGB** (primary source for the HLS resize testbench)
-- `test/images/` — 654 PNGs, 384×288 RGB
-- `train/masks_3class/`, `test/masks_3class/` — segmentation masks (unused by the resize work)
+Both kernels feed their HLS C-testbenches the same way: NYU PNG → `PIL.Image.convert("L")` 8-bit grayscale → headerless `.bin` files (one byte per pixel, row-major, no header). For each dataset, we use bit level assertation and visualization([apply_hardware_design_project/sw/vis/](apply_hardware_design_project/sw/vis/) to check it's correctness.
 
-For the resize stage we convert RGB → 8-bit grayscale with `PIL.Image.convert("L")` and feed the raw uint8 bytes into the HLS C-testbench via headerless `.bin` files. Five fixed cases are generated and checked bit-exactly against the Python golden:
+**Resize fixtures.** Five fixed cases generated by [sw/prepare_real_data.py](apply_hardware_design_project/sw/prepare_real_data.py), checked bit-exactly against the Python golden `resize_vectorized`:
 
 | case | input | output | coverage |
 |---|---|---|---|
@@ -57,35 +69,44 @@ For the resize stage we convert RGB → 8-bit grayscale with `PIL.Image.convert(
 | `nyu_identity`          | 384×288 | 384×288 | no-op smoke test |
 | `nyu_square_96`         | 384×288 | 96×96   | both axes stretched |
 
-Paired side-by-side visualizations land under [apply_hardware_design_project/sw/vis/](apply_hardware_design_project/sw/vis/) for eyeball checks (border artifacts, obvious aliasing).
+Per-case files: `<case>_in.bin` (input grayscale bytes), `<case>_gold.bin` (Python golden output), plus a line in `cases.txt` that the testbench reads to drive the run. Pair PNGs land in `sw/vis/<case>_pair.png` (input | output, eyeball check for border artifacts and aliasing).
 
 
-## python golden model
 
-[apply_hardware_design_project/sw/resize.py](apply_hardware_design_project/sw/resize.py) is the reference resize with bilinear interpolation. It follows the `u = sₓ·x, v = sᵧ·y` formulation in [apply_hardware_design_project/plan.md](apply_hardware_design_project/plan.md) (no half-pixel centering), and every arithmetic step runs in **float32** so the model is bit-exact against the HLS kernel and its C-sim testbench.
+**Rectify fixtures.** Five real-image cases generated by [sw/prepare_real_rectify_data.py](apply_hardware_design_project/sw/prepare_real_rectify_data.py), each with its own remap table, checked bit-exactly against `rectify_vectorized`:
 
-Three entry points:
+| case | input | output | map | coverage |
+|---|---|---|---|---|
+| `nyu_rectify_identity`     | 384×288 | 384×288 | `(x, y)`                                  | rectify ≡ copy (smoke) |
+| `nyu_rectify_shift_frac`   | 384×288 | 384×288 | `(x+0.25, y+0.50)`                        | fractional shift / bilinear interp |
+| `nyu_rectify_crop_192x144` | 384×288 | 192×144 | `(x+96, y+72)`                            | integer-offset sub-window |
+| `nyu_rectify_zoom_2x`      | 384×288 | 384×288 | half-pixel-per-output centre-zoom         | non-trivial scale map |
+| `nyu_rectify_barrel_mild`  | 384×288 | 384×288 | `c + (1 + k·r²)·(x − c)`, `k = 0.10`      | radial distortion + edge clamp |
+
+Per-case files: `<case>_in.bin` (uint8 input), `<case>_map_x.bin` + `<case>_map_y.bin` (float32 remap tables, row-major), `<case>_gold.bin` (uint8 output), plus a line in `rectify_cases.txt`. The barrel case is the canonical "lens-distortion correction" use-case for a robotics rectify pipeline; pair PNGs in `sw/vis/nyu_rectify_*_pair.png` show the warped output against the original frame.
+
+
+
+> **Cosim caveat (rectify only):** the real-data tier runs in C-sim only. Vitis HLS's `m_axi` pointer wrapper segfaults on the 384×288 buffers during C/RTL co-simulation, so `run_rectify_hls.tcl` sets `RECTIFY_TB_SKIP_REAL_DATA=1` before `cosim_design` and the cosim phase runs the 5 synthetic cases only. C-sim already validates Python-golden ↔ HLS-top-level math bit-exact across the 5 NYU cases; cosim's job is RTL ↔ C equivalence, which the synthetic cases cover.
+
+
+## resize_kernel
+
+`resize_kernel` performs bilinear downscale or upscale on a streaming image. The HLS C++ kernel ([hls/resize.cpp](apply_hardware_design_project/hls/resize.cpp)) and the Python golden ([sw/resize.py](apply_hardware_design_project/sw/resize.py)) share the same `u = sₓ·x, v = sᵧ·y` formulation (no half-pixel centering, see [plan.md](apply_hardware_design_project/plan.md)) in **float32**, so the C-testbench `memcmp`s outputs bit-exactly against the Python golden — no tolerance windows.
+
+### python golden model
+
+[sw/resize.py](apply_hardware_design_project/sw/resize.py) is the reference implementation, every arithmetic step in float32. Three entry points:
 
 - `bilinear_sample(img, u, v)` — single-sample helper, border-clamped to `[0, W−1] × [0, H−1]`.
 - `resize(img, out_h, out_w)` — plain double loop; maps 1:1 to the HLS schedule and is the easiest path for line-by-line comparison against an HLS C-sim trace.
-- `resize_vectorized(img, out_h, out_w)` — same math, numpy-vectorized; used to generate real-data goldens.
+- `resize_vectorized(img, out_h, out_w)` — same math, numpy-vectorized; used by `prepare_real_data.py` to generate the real-data goldens documented in [data preprocessing](#data-preprocessing-and-testcase-build).
 
-Run the unit tests (loop vs vectorized bit-exact, identity, shapes, hand-computed 2×2, OpenCV if installed):
+Run the unit tests (loop vs vectorized bit-exact, identity, shapes, hand-computed 2×2, OpenCV cross-check if installed):
 
 ```
 python apply_hardware_design_project/sw/test_resize.py
 ```
-
-Generate the real-image test fixtures for the HLS testbench (writes `apply_hardware_design_project/hls/testdata/*.bin` + `cases.txt` and the visualization PNGs under `apply_hardware_design_project/sw/vis/`):
-
-```
-python apply_hardware_design_project/sw/prepare_real_data.py
-```
-
-
-## hls hardware implementation
-
-Vitis HLS C++ kernel for the resize stage lives under [apply_hardware_design_project/hls/](apply_hardware_design_project/hls/). It implements the same `u = sₓ·x, v = sᵧ·y` math as the Python golden in float32, so the C-testbench can `memcmp` the outputs bit-exactly — no tolerance windows.
 
 ### files
 
@@ -169,7 +190,7 @@ vitis_hls -f run_hls.tcl csynth     # C synthesis only
 vitis_hls -f run_hls.tcl cosim      # RTL/C co-simulation (needs csynth first)
 ```
 
-Target in the script is `xczu7ev-ffvc1156-2-e` (Zynq UltraScale+ ZCU104-class) at a **5 ns** clock — adjust `PART` / `PERIOD` in [run_hls.tcl](apply_hardware_design_project/hls/run_hls.tcl) for a different board. The project tree is written to `hls/resize_hls/sol1/`; synthesis and cosim reports land under `sol1/syn/report/` and `sol1/sim/report/`.
+Target in the script is `xc7z020clg400-1` (Zynq-7020 on PYNQ-Z2) at a **10 ns** clock — adjust `PART` / `PERIOD` in [run_hls.tcl](apply_hardware_design_project/hls/run_hls.tcl) for a different board. The project tree is written to `hls/resize_hls/sol1/`; synthesis and cosim reports land under `sol1/syn/report/` and `sol1/sim/report/`.
 
 Before running cosim with real images, regenerate the fixtures once:
 
@@ -177,36 +198,48 @@ Before running cosim with real images, regenerate the fixtures once:
 python apply_hardware_design_project/sw/prepare_real_data.py
 ```
 
-### verification & synthesis (latest run)
+### verification & synthesis
 
 | phase | result |
 |---|---|
 | Python golden tests ([sw/test_resize.py](apply_hardware_design_project/sw/test_resize.py)) | 5/5 PASS (loop ≡ vectorized bit-exact, identity, shapes, hand-computed 2×2, OpenCV cross-check skipped when `cv2` absent) |
 | HLS C-simulation (synthetic) | `downscale` / `upscale` / `identity` / `non-integer` / `wide` — 5/5 PASS |
 | HLS C-simulation (NYU real-data) | `nyu_downscale_320x240` / `nyu_half` / `nyu_upscale_640x480` / `nyu_identity` / `nyu_square_96` — 5/5 PASS, byte-exact against `_gold.bin` from `resize_vectorized` |
-| HLS C-synthesis | completes; top-module slack reported as `−0.00 ns` at 5 ns target (marginal, see below) |
+| HLS C-synthesis | completes; top-module slack reported as `−0.70 ns` at 10 ns target (EMIT_PIXEL pipeline; closes ≈93 MHz) |
 | HLS C/RTL co-simulation | 10/10 PASS (both tiers); max `hls::stream` depth = 307,200 (= 640×480, largest real-data case) |
 
-Resource estimates from `hls/resize_hls/sol1/syn/report/csynth.rpt` (target `xczu7ev-ffvc1156-2-e`):
+Resource estimates from `hls/resize_hls/sol1/syn/report/csynth.rpt` (target `xc7z020clg400-1` @ 10 ns):
 
 | resource | usage | % of part |
 |---|---|---|
-| BRAM | 2 | ~0% |
-| DSP  | 37 | 2% |
-| FF   | 5,206 | 1% |
-| LUT  | 6,406 | 2% |
+| BRAM | 2     | ~0% |
+| DSP  | 37    | 16% |
+| FF   | 4,852 | 4%  |
+| LUT  | 8,699 | 16% |
 
-Schedule numbers from the same report: `LOAD_ROW` inner loop achieves **II = 1** (1922 cycles for 1920 input pixels); `EMIT_PIXEL` inner loop achieves **II = 1** with 79-cycle iteration latency (1997 cycles for 1920 output pixels). The conservative top-module latency in `csynth.rpt` (≈ 2.38 G cycles) is HLS's static worst-case bound for a full 1920×1080 pass — it assumes the outer `EMIT` re-traverses all output rows every input row, which the algorithm does not actually do; cosim confirms the realised throughput tracks `in_h × in_w + out_h × out_w` pixels at II=1.
+**Reading the table.** The shape — **DSP and LUT both ≈ 16 %, BRAM near-zero, FF moderate** — is the classic fingerprint of a **compute-bound streaming float32 pipeline**: every output pixel runs ~10 parallel float multiplies (DSP), the float adder / exponent / clamp glue burns LUT, FF banks the 63-stage `EMIT_PIXEL` pipeline, and the only on-chip state is the 2-row line buffer (BRAM, frame-size-independent). DSP and LUT moving together is the float32 tell — going fixed-point would roughly halve both. Resize stays under 20 % on every metric, so ≥ 80 % of `xc7z020` is still free for `rectify_kernel`, DMA, AXI interconnect, and the ROS-side glue.
 
-## rectify
+**Frame latency / throughput on `xc7z020` @ 100 MHz** (steady-state II=1; cycles ≈ `in_h·in_w + out_h·out_w` because both `LOAD_ROW` and `EMIT_PIXEL` run at 1 pixel/cycle):
 
-The rectify stage runs after resize and remaps every output pixel `(x, y)` from a source coordinate `(u, v) = (map_x[y, x], map_y[y, x])`. It reuses the resize stage's bilinear sampler, BORDER_REPLICATE clamp, and uint8 truncation, so the Python golden and the HLS kernel share one arithmetic convention end-to-end and the testbench can `memcmp` outputs with zero tolerance.
+| in → out                  | cycles  | wall      | throughput |
+|---|---|---|---|
+| 1920×1080 → 1920×1080     | 4.15 M  | 41.5 ms   | 24 fps     |
+| 1280×720  → 1280×720      | 1.84 M  | 18.4 ms   | 54 fps     |
+| 640×480   → 640×480       | 614 K   | 6.1 ms    | 163 fps    |
+| 384×288   → 384×288       | 221 K   | 2.2 ms    | 450 fps    |
+
+First-pixel-out latency is short (≈ 2 input rows + the 63-cycle `EMIT_PIXEL` iteration latency ≈ 20 µs at 1080p), so downstream consumers see the first pixel long before the frame finishes — useful when chaining into a streaming rectify variant. For asymmetric shapes (e.g. 1080p → 96×96) the input-streaming term `in_h·in_w` dominates and the output is essentially free.
+
+## rectify_kernel
+
+`rectify_kernel` remaps every output pixel `(x, y)` from a source coordinate `(u, v) = (map_x[y, x], map_y[y, x])` supplied by the PS. It reuses the resize stage's bilinear sampler, BORDER_REPLICATE clamp, and uint8 truncation, so the Python golden ([sw/rectify.py](apply_hardware_design_project/sw/rectify.py)) and the HLS kernel ([hls/rectify.cpp](apply_hardware_design_project/hls/rectify.cpp)) share one arithmetic convention end-to-end — the in-file `golden_sample()` in the testbench is a line-by-line port and `memcmp` succeeds with zero tolerance.
 
 ### python golden model
 
-[apply_hardware_design_project/sw/rectify.py](apply_hardware_design_project/sw/rectify.py) reuses `bilinear_sample()` from `resize.py`, so border-clamp and float32 accumulation are inherited unchanged. Three entry points:
+[sw/rectify.py](apply_hardware_design_project/sw/rectify.py) reuses `bilinear_sample()` from `resize.py`, so border-clamp and float32 accumulation are inherited unchanged. Four entry points:
 
 - `rectify(img_in, map_x, map_y)` — plain double loop over output pixels; maps 1:1 to the HLS schedule. Returns `img_in.dtype` after `np.clip(0, 255).astype(...)` (truncation, not rounding — matches `(uint8_t)(int)acc` in the kernel).
+- `rectify_vectorized(img_in, map_x, map_y)` — same math, numpy-vectorized; used by `prepare_real_rectify_data.py` to generate the real-data goldens documented in [data preprocessing](#data-preprocessing-and-testcase-build).
 - `identity_maps(h, w)` — returns `(map_x, map_y)` with `map_x[y, x] = x` and `map_y[y, x] = y`. The rectified output equals the input bit-for-bit.
 - `shifted_maps(h, w, dx, dy)` — identity map plus a constant `(dx, dy)` shift. Drives the fractional-pixel tests.
 
@@ -216,26 +249,14 @@ Run the unit tests (identity copy / fractional shape & dtype / border-replicate 
 python apply_hardware_design_project/sw/test_rectify.py
 ```
 
-Regenerate the binary fixtures under `hls/testdata/rectify_*.bin` (an 8×8 `np.arange` ramp sampled with `(dx=0.25, dy=0.5)`):
-
-```
-python apply_hardware_design_project/sw/gen_rectify_testdata.py
-```
-
-These fixtures are a Python-side cross-check artifact — feeding the committed `rectify_input.bin` + `rectify_map_{x,y}.bin` through `rectify()` reproduces `rectify_expected.bin` byte-for-byte. They are **not** consumed by the HLS C-testbench today; the testbench is self-contained (see below).
-
-### hls hardware implementation
-
-Vitis HLS C++ kernel for the rectify stage lives in [hls/rectify.cpp](apply_hardware_design_project/hls/rectify.cpp). Same float32 math, same uint8 truncation, same BORDER_REPLICATE clamp as the Python golden — the in-file `golden_sample()` in the testbench is a line-by-line port.
-
-#### files
+### files
 
 - [hls/rectify.h](apply_hardware_design_project/hls/rectify.h) — top-level declarations, `pixel_t = ap_uint<8>`, `dim_t = ap_uint<13>`, compile-time bounds `RECTIFY_MAX_IN_W/H`, `RECTIFY_MAX_OUT_W/H` (default 1920×1080).
 - [hls/rectify.cpp](apply_hardware_design_project/hls/rectify.cpp) — `rectify_kernel(...)`, the synthesizable top.
 - [hls/rectify_tb.cpp](apply_hardware_design_project/hls/rectify_tb.cpp) — self-contained C-testbench: 5 deterministic cases, no external fixtures.
 - [hls/run_rectify_hls.tcl](apply_hardware_design_project/hls/run_rectify_hls.tcl) — Vitis HLS build/flow script (csim / csynth / cosim).
 
-#### interface
+### interface
 
 ```
 void rectify_kernel(
@@ -251,7 +272,7 @@ void rectify_kernel(
 - **Control plane**: all dims plus 64-bit base pointers exposed through one `s_axilite` `ctrl` bundle alongside the standard `return` register (`ap_start` / `ap_done` / `ap_idle` / `ap_ready` + `interrupt`).
 - Unlike `resize_kernel`, this is a baseline memory-mapped design: no on-chip line buffer, every input tap goes back to DDR through `gmem_img`. The optimized line-buffered + output-queue path with DDR slow-path fallback is described in [plan.md](apply_hardware_design_project/plan.md) and is **not** implemented yet.
 
-#### coordinate & math (matches the golden exactly)
+### coordinate & math (matches the golden exactly)
 
 For every output pixel `(x, y)`:
 
@@ -266,7 +287,7 @@ out = clamp(Σ w_ij · p_ij, 0, 255) truncated to uint8
 
 The clamp-on-address trick handles arbitrary map values (BORDER_REPLICATE) without ever issuing an out-of-range pointer read. Float accumulation order matches the Python golden, so `memcmp` against the testbench gold succeeds bit-exactly with no tolerance window.
 
-#### schedule — m_axi-per-pixel baseline, II=4
+### schedule — m_axi-per-pixel baseline, II=4
 
 The kernel is two nested loops with `PIPELINE II=1` requested on the inner body ([rectify.cpp:84](apply_hardware_design_project/hls/rectify.cpp#L84)):
 
@@ -282,11 +303,13 @@ OUT_X:    for x in 0..out_w−1:                       # PIPELINE II=1 requested
 
 Each iteration issues two `float` map reads, four 8-bit image taps, one 8-bit output write, plus the bilinear arithmetic. HLS settles on **II = 4 cycles/pixel** in `csynth.rpt` — the inner loop is bottlenecked by memory dependencies, not by the float chain. No line buffer is instantiated.
 
-For a full 1920×1080 frame the report measures **8,294,489 cycles ≈ 41 ms @ 200 MHz**. That fits a ~24 fps budget but not 60 fps. The route to II=1 is the line-buffered + output-queue variant described in `plan.md` (deferred).
+For a full 1920×1080 frame the report measures **8,294,471 cycles ≈ 82.9 ms @ 100 MHz** on `xc7z020`. That sustains ~12 fps for full HD; smaller frame sizes scale linearly (e.g. ~14 ms / 70 fps for 640×480). The route to II=1 is the line-buffered + output-queue variant described in `plan.md` (deferred).
 
-#### testbench
+### testbench
 
-[hls/rectify_tb.cpp](apply_hardware_design_project/hls/rectify_tb.cpp) drives 5 deterministic cases and fails on any byte mismatch:
+[hls/rectify_tb.cpp](apply_hardware_design_project/hls/rectify_tb.cpp) runs **two tiers** and fails on any byte mismatch:
+
+1. **Synthetic cases** — 5 deterministic shape regimes built in-file, golden produced by the in-file `golden_sample()` C++ port of `sw/rectify.py`:
 
 | case | in → out | map style | coverage |
 |---|---|---|---|
@@ -296,9 +319,11 @@ For a full 1920×1080 frame the report measures **8,294,489 cycles ≈ 41 ms @ 2
 | `border_clamp`  | 32×24 → 32×24 | rotating `−5` / `in_w+8` / `in_h+9` / both-OOB | replicate-clamp stress |
 | `scale_map`     | 23×17 → 29×11 | half-pixel-centered scale | non-integer in & out dims |
 
-Failures print `errors=N first=I hw=… gold=… max_abs=…` and the driver returns non-zero. The 8×8 `.bin` fixtures under [hls/testdata/](apply_hardware_design_project/hls/testdata/) are **not** wired into this testbench — they are a Python-side cross-check only.
+2. **Real-data cases** — 5 NYU 384×288 images driven by the `.bin` fixtures produced by [sw/prepare_real_rectify_data.py](apply_hardware_design_project/sw/prepare_real_rectify_data.py) (identity / fractional shift / crop / centre-zoom / mild barrel — see the [data preprocessing](#data-preprocessing-and-testcase-build) section). The tb `memcmp`s the kernel output against `_gold.bin` from `rectify_vectorized`. Gated by `RECTIFY_TB_SKIP_REAL_DATA` — `run_rectify_hls.tcl` sets this for the cosim phase only, so the real-data tier runs in csim but not cosim (see cosim caveat).
 
-#### build / run
+Failures print `errors=N first=I hw=… gold=… max_abs=…` and the driver returns non-zero.
+
+### build / run
 
 From [apply_hardware_design_project/hls/](apply_hardware_design_project/hls/):
 
@@ -309,13 +334,39 @@ vitis_hls -f run_rectify_hls.tcl csynth     # C synthesis only
 vitis_hls -f run_rectify_hls.tcl cosim      # RTL/C co-simulation (needs csynth first)
 ```
 
-Target part and clock match the resize project: `xczu7ev-ffvc1156-2-e` @ **5 ns**, configurable via `PART` / `PERIOD` in [run_rectify_hls.tcl](apply_hardware_design_project/hls/run_rectify_hls.tcl). The build tree lands under `hls/rectify_hls/sol1/`; synthesis reports under `sol1/syn/report/`, cosim logs under `sol1/sim/report/`.
+Target part and clock match the resize project: `xc7z020clg400-1` @ **10 ns** (PYNQ-Z2), configurable via `PART` / `PERIOD` in [run_rectify_hls.tcl](apply_hardware_design_project/hls/run_rectify_hls.tcl). The build tree lands under `hls/rectify_hls/sol1/`; synthesis reports under `sol1/syn/report/`, cosim logs under `sol1/sim/report/`.
 
-Latest verified state (xczu7ev @ 5 ns): csim 5/5 PASS, csynth completes with zero timing-slack violations, cosim 5/5 PASS. Resource estimates from `csynth.rpt`:
+### verification & synthesis
+
+Latest verified state (`xc7z020` @ 10 ns): csim **10/10 PASS** (5 synth + 5 NYU real-data), csynth completes with **slack 0.00 ns** (clean), cosim 5/5 PASS (synth only — the real-data tier is skipped via `RECTIFY_TB_SKIP_REAL_DATA`, see the [data preprocessing](#data-preprocessing-and-testcase-build) cosim caveat). Resource estimates from `csynth.rpt`:
 
 | resource | usage | % of part |
 |---|---|---|
-| BRAM | 12 | 1% |
-| DSP  | 13 | ~0% |
-| FF   | 7,542 | 1% |
-| LUT  | 8,903 | 3% |
+| BRAM | 12    | 4%  |
+| DSP  | 13    | 5%  |
+| FF   | 7,508 | 7%  |
+| LUT  | 9,623 | 18% |
+
+The fingerprint **flips versus resize**: BRAM ↑ (line / burst buffers for the 4 `m_axi` ports), DSP ↓ (II = 4 lets HLS time-share multipliers across 4 cycles instead of laying them out in parallel), LUT comparable (float32 glue dominates either way). Same bilinear math, opposite hardware shape — that's the streaming-vs-memory-mapped architecture choice showing up in numbers.
+
+**Frame latency / throughput on `xc7z020` @ 100 MHz** (II=4, memory-bound; cycles = `4 · out_h · out_w` — fully output-bound):
+
+| in → out                  | cycles  | wall      | throughput |
+|---|---|---|---|
+| 1920×1080 → 1920×1080     | 8.29 M  | 82.9 ms   | 12 fps     |
+| 1280×720  → 1280×720      | 3.69 M  | 36.9 ms   | 27 fps     |
+| 640×480   → 640×480       | 1.23 M  | 12.3 ms   | 81 fps     |
+| 384×288   → 384×288       | 442 K   | 4.4 ms    | 226 fps    |
+
+The line-buffered + output-queue optimisation in [plan.md](apply_hardware_design_project/plan.md) drops II to 1 — projected 1080p wall-time would fall from 83 ms to ≈ 21 ms (≈ 48 fps, **~4× speed-up**), and 720p would clear 100 fps.
+
+**End-to-end (resize → DDR → rectify, sequential baseline)** — rectify reads its image from DDR, so the two stages can't pipeline through AXI-Stream; resize must fully drain to DDR before rectify starts:
+
+| frame size  | resize  | rectify | total    | composite throughput |
+|---|---|---|---|---|
+| 1920×1080   | 41.5 ms | 82.9 ms | ≈ 124 ms | ≈ 8 fps   |
+| 1280×720    | 18.4 ms | 36.9 ms | ≈ 55 ms  | ≈ 18 fps  |
+| 640×480     | 6.1 ms  | 12.3 ms | ≈ 18 ms  | ≈ 55 fps  |
+| 384×288     | 2.2 ms  | 4.4 ms  | ≈ 6.6 ms | ≈ 150 fps |
+
+Rectify is the bottleneck across the board. AMD's ROS 2 Perception Node typically runs at 640×480 or 720p where the baseline already clears 18–55 fps — landing the optimised rectify variant takes the 640×480 budget under 8 ms (>120 fps), comfortably real-time for downstream detection / SLAM.
