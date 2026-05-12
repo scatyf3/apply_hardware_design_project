@@ -7,8 +7,8 @@
 
 set PROJECT "rectify_hls"
 set SOLUTION "sol1"
-set PART "xczu7ev-ffvc1156-2-e"
-set PERIOD 5
+set PART "xc7z020clg400-1"
+set PERIOD 10
 
 set action "all"
 if {$argc > 0} {
