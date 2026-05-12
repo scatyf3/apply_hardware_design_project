@@ -1,3 +1,20 @@
+# Real-Time ROS 2 Camera Preprocessing Accelerator
+
+Two Vitis HLS image-processing kernels for the AMD ROS 2 Perception Node pipeline: bilinear `resize_kernel` and map-based `rectify_kernel`. Architecture and motivation are in [plan.md](apply_hardware_design_project/plan.md); this README is the build / test / verification reference for both stages.
+
+## verification at a glance
+
+All results from Vitis HLS 2023.2, target part `xczu7ev-ffvc1156-2-e` (Zynq UltraScale+ ZCU104-class) at a 5 ns clock target.
+
+| stage | python tests | hls csim | csynth | hls cosim | resources (BRAM / DSP / FF / LUT) |
+|---|---|---|---|---|---|
+| `resize_kernel`  | 5/5 PASS | 5/5 PASS | done; slack `−0.00 ns` (marginal) | 10/10 PASS (5 synthetic + 5 NYU real-data) | 2 / 37 / 5,206 / 6,406 |
+| `rectify_kernel` | 4/4 PASS | 5/5 PASS | done; slack `0.00 ns` (clean)    | 5/5 PASS                                   | 12 / 13 / 7,542 / 8,903 |
+
+Per-case verification tables, schedule analysis, and resource percentages of the target part are in the respective sections below. Raw HLS reports live under `hls/{resize,rectify}_hls/sol1/syn/report/` and `…/sim/report/`; the build trees are intentionally excluded from version control via `.gitignore` (`hls/*_hls/`) — the tables in this README are the canonical summary.
+
+The resize top-module slack of `−0.00 ns` is HLS flagging a sub-rounding timing violation on the `EMIT_PIXEL` pipeline at the 5 ns target. The kernel synthesizes and co-simulates correctly; closing timing in Vivado place-and-route may require a slightly relaxed clock or LUT-area trade. The rectify kernel meets the same 5 ns target with no warning.
+
 ## python environment
 
 The Python side (golden model + real-data fixture generation) only needs `numpy` and `Pillow`, pinned in [apply_hardware_design_project/requirements.txt](apply_hardware_design_project/requirements.txt). Any Python ≥ 3.9 works; tested on 3.10.
@@ -159,6 +176,27 @@ Before running cosim with real images, regenerate the fixtures once:
 ```
 python apply_hardware_design_project/sw/prepare_real_data.py
 ```
+
+### verification & synthesis (latest run)
+
+| phase | result |
+|---|---|
+| Python golden tests ([sw/test_resize.py](apply_hardware_design_project/sw/test_resize.py)) | 5/5 PASS (loop ≡ vectorized bit-exact, identity, shapes, hand-computed 2×2, OpenCV cross-check skipped when `cv2` absent) |
+| HLS C-simulation (synthetic) | `downscale` / `upscale` / `identity` / `non-integer` / `wide` — 5/5 PASS |
+| HLS C-simulation (NYU real-data) | `nyu_downscale_320x240` / `nyu_half` / `nyu_upscale_640x480` / `nyu_identity` / `nyu_square_96` — 5/5 PASS, byte-exact against `_gold.bin` from `resize_vectorized` |
+| HLS C-synthesis | completes; top-module slack reported as `−0.00 ns` at 5 ns target (marginal, see below) |
+| HLS C/RTL co-simulation | 10/10 PASS (both tiers); max `hls::stream` depth = 307,200 (= 640×480, largest real-data case) |
+
+Resource estimates from `hls/resize_hls/sol1/syn/report/csynth.rpt` (target `xczu7ev-ffvc1156-2-e`):
+
+| resource | usage | % of part |
+|---|---|---|
+| BRAM | 2 | ~0% |
+| DSP  | 37 | 2% |
+| FF   | 5,206 | 1% |
+| LUT  | 6,406 | 2% |
+
+Schedule numbers from the same report: `LOAD_ROW` inner loop achieves **II = 1** (1922 cycles for 1920 input pixels); `EMIT_PIXEL` inner loop achieves **II = 1** with 79-cycle iteration latency (1997 cycles for 1920 output pixels). The conservative top-module latency in `csynth.rpt` (≈ 2.38 G cycles) is HLS's static worst-case bound for a full 1920×1080 pass — it assumes the outer `EMIT` re-traverses all output rows every input row, which the algorithm does not actually do; cosim confirms the realised throughput tracks `in_h × in_w + out_h × out_w` pixels at II=1.
 
 ## rectify
 
