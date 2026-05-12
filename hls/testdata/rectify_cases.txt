@@ -1,0 +1,5 @@
+nyu_rectify_identity 288 384 288 384
+nyu_rectify_shift_frac 288 384 288 384
+nyu_rectify_crop_192x144 288 384 144 192
+nyu_rectify_zoom_2x 288 384 288 384
+nyu_rectify_barrel_mild 288 384 288 384

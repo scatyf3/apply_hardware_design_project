@@ -33,11 +33,15 @@ switch -- $action {
         csynth_design
     }
     cosim {
+        # cosim's m_axi pointer wrapper segfaults on the 384x288 NYU buffers,
+        # so the real-data tier runs in csim only. See rectify_tb.cpp.
+        set ::env(RECTIFY_TB_SKIP_REAL_DATA) 1
         cosim_design -rtl verilog
     }
     all - default {
         csim_design
         csynth_design
+        set ::env(RECTIFY_TB_SKIP_REAL_DATA) 1
         cosim_design -rtl verilog
     }
 }

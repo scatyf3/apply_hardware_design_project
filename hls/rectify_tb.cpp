@@ -2,6 +2,10 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <vector>
 
 #define MAX_PIXELS 2048
 
@@ -184,6 +188,158 @@ static int run_case(
     return 1;
 }
 
+// Read expected_count elements of T from path into a vector. Empty on failure.
+template <typename T>
+static std::vector<T> load_bin_vec(const std::string &path, size_t expected_count) {
+    std::vector<T> buf;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return buf;
+    buf.resize(expected_count);
+    size_t got = fread(buf.data(), sizeof(T), expected_count, f);
+    fclose(f);
+    if (got != expected_count) buf.clear();
+    return buf;
+}
+
+// Drives rectify_kernel with real .bin fixtures produced by
+// sw/prepare_real_rectify_data.py and memcmps the result against the Python
+// golden's _gold.bin output. Buffers are heap-allocated so the static
+// MAX_PIXELS budget for the synthetic cases above doesn't apply.
+static int run_real_case(
+    const char *name,
+    const std::string &in_path,
+    const std::string &mx_path,
+    const std::string &my_path,
+    const std::string &gold_path,
+    int in_w, int in_h, int out_w, int out_h
+) {
+    std::vector<uint8_t> in_img =
+        load_bin_vec<uint8_t>(in_path, (size_t)in_w * in_h);
+    if (in_img.empty()) {
+        printf("[real-data %s] FAIL: could not read %s\n", name, in_path.c_str());
+        return 1;
+    }
+    std::vector<float> map_x_buf =
+        load_bin_vec<float>(mx_path, (size_t)out_w * out_h);
+    if (map_x_buf.empty()) {
+        printf("[real-data %s] FAIL: could not read %s\n", name, mx_path.c_str());
+        return 1;
+    }
+    std::vector<float> map_y_buf =
+        load_bin_vec<float>(my_path, (size_t)out_w * out_h);
+    if (map_y_buf.empty()) {
+        printf("[real-data %s] FAIL: could not read %s\n", name, my_path.c_str());
+        return 1;
+    }
+    std::vector<uint8_t> gold_out =
+        load_bin_vec<uint8_t>(gold_path, (size_t)out_w * out_h);
+    if (gold_out.empty()) {
+        printf("[real-data %s] FAIL: could not read %s\n", name, gold_path.c_str());
+        return 1;
+    }
+
+    std::vector<pixel_t> in_buf((size_t)in_w * in_h);
+    for (size_t i = 0; i < in_buf.size(); i++) in_buf[i] = (pixel_t)in_img[i];
+    std::vector<pixel_t> out_buf((size_t)out_w * out_h);
+
+    rectify_kernel(
+        in_buf.data(),
+        map_x_buf.data(),
+        map_y_buf.data(),
+        out_buf.data(),
+        (dim_t)in_w, (dim_t)in_h,
+        (dim_t)out_w, (dim_t)out_h
+    );
+
+    int errors = 0;
+    int first = -1;
+    int max_abs = 0;
+    for (int i = 0; i < out_w * out_h; i++) {
+        int got = (int)(uint8_t)out_buf[i];
+        int exp = (int)gold_out[i];
+        int d = got - exp;
+        int ad = d < 0 ? -d : d;
+        if (ad != 0) {
+            errors++;
+            if (first < 0) first = i;
+            if (ad > max_abs) max_abs = ad;
+        }
+    }
+
+    if (errors == 0) {
+        printf("[real-data %s] PASS (%dx%d -> %dx%d)\n",
+               name, in_w, in_h, out_w, out_h);
+        return 0;
+    }
+    printf("[real-data %s] FAIL (%dx%d -> %dx%d): errors=%d first=%d hw=%u gold=%u max_abs=%d\n",
+           name, in_w, in_h, out_w, out_h, errors, first,
+           first >= 0 ? (unsigned)(uint8_t)out_buf[first] : 0,
+           first >= 0 ? (unsigned)gold_out[first] : 0,
+           max_abs);
+    return 1;
+}
+
+// Vitis HLS C-sim launches from .../rectify_hls/sol1/csim/build, so walk a few
+// candidate paths until we find testdata/rectify_cases.txt — same trick as the
+// resize testbench.
+static std::string find_rectify_testdata_dir() {
+    static const char *candidates[] = {
+        "testdata",
+        "../testdata",
+        "../../testdata",
+        "../../../testdata",
+        "../../../../testdata",
+        "../../../../../testdata",
+    };
+    for (const char *c : candidates) {
+        std::string p = std::string(c) + "/rectify_cases.txt";
+        FILE *f = fopen(p.c_str(), "r");
+        if (f) { fclose(f); return c; }
+    }
+    return std::string();
+}
+
+static int run_real_data_tests() {
+    // Allow callers (run_rectify_hls.tcl cosim path) to skip this tier — cosim's
+    // m_axi pointer wrapper cannot handle the 384x288 buffers we use for the
+    // real-data cases and segfaults the C TB process. csim still exercises them
+    // end-to-end, so RTL/C equivalence on the synthetic cases is sufficient.
+    const char *skip = getenv("RECTIFY_TB_SKIP_REAL_DATA");
+    if (skip && skip[0] && skip[0] != '0') {
+        printf("[real-data] skipped (RECTIFY_TB_SKIP_REAL_DATA=%s)\n", skip);
+        return 0;
+    }
+
+    std::string dir = find_rectify_testdata_dir();
+    if (dir.empty()) {
+        printf("[real-data] testdata/rectify_cases.txt not found — "
+               "skipping (run sw/prepare_real_rectify_data.py to generate)\n");
+        return 0;
+    }
+    printf("[real-data] using %s/\n", dir.c_str());
+
+    std::string manifest = dir + "/rectify_cases.txt";
+    FILE *f = fopen(manifest.c_str(), "r");
+    if (!f) {
+        printf("[real-data] open failed: %s\n", manifest.c_str());
+        return 1;
+    }
+
+    int fails = 0;
+    char name[128];
+    int in_h, in_w, out_h, out_w;
+    while (fscanf(f, "%127s %d %d %d %d", name, &in_h, &in_w, &out_h, &out_w) == 5) {
+        std::string in_p   = dir + "/" + name + "_in.bin";
+        std::string mx_p   = dir + "/" + name + "_map_x.bin";
+        std::string my_p   = dir + "/" + name + "_map_y.bin";
+        std::string gold_p = dir + "/" + name + "_gold.bin";
+        fails += run_real_case(name, in_p, mx_p, my_p, gold_p,
+                               in_w, in_h, out_w, out_h);
+    }
+    fclose(f);
+    return fails;
+}
+
 int main() {
     int fails = 0;
 
@@ -192,6 +348,8 @@ int main() {
     fails += run_case("crop",          48, 36, 24, 18, 2);
     fails += run_case("border_clamp",  32, 24, 32, 24, 3);
     fails += run_case("scale_map",     23, 17, 29, 11, 4);
+
+    fails += run_real_data_tests();
 
     if (fails == 0) {
         printf("\nAll HLS rectify tests passed.\n");
