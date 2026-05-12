@@ -6,13 +6,13 @@
 #   vitis_hls -f run_hls.tcl csynth   # only C synthesis
 #   vitis_hls -f run_hls.tcl cosim    # only co-simulation (needs csynth first)
 #
-# The target part/clock match a typical Zynq UltraScale+ dev board; adjust
+# The target part/clock match the PYNQ-Z2 (Zynq-7020) board; adjust
 # `PART` and `PERIOD` for your actual target.
 
 set PROJECT "resize_hls"
 set SOLUTION "sol1"
-set PART     "xczu7ev-ffvc1156-2-e"
-set PERIOD   5
+set PART     "xc7z020clg400-1"
+set PERIOD   10
 
 set action "all"
 if {$argc > 0} {

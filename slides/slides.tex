@@ -36,7 +36,7 @@
 \newcommand{\hi}[1]{\textbf{#1}}
 
 \title{Real-Time ROS\,2 Camera Preprocessing Accelerator}
-\subtitle{Bilinear Resize + Map-based Rectify on Zynq UltraScale+}
+\subtitle{Bilinear Resize + Map-based Rectify on PYNQ-Z2 (Zynq-7020)}
 \author{Jason Pan \and Yifei Feng}
 \institute{HLS-based FPGA IP for the AMD ROS\,2 Perception Node}
 \date{May 2026}
@@ -51,7 +51,7 @@
 Hi -- our final project is two Vitis HLS image-processing kernels that
 sit in front of the AMD ROS\,2 Perception Node: a bilinear
 \code{resize\_kernel} and a map-based \code{rectify\_kernel}, both
-targeting the ZCU104 Zynq UltraScale+ board.  Both are verified
+targeting the PYNQ-Z2 Zynq-7020 board.  Both are verified
 end-to-end through Python golden, HLS C-simulation, C-synthesis, and
 RTL co-simulation.  I'll spend the next four minutes on the motivation,
 each kernel's hardware schedule, and the verification numbers.%
@@ -204,11 +204,11 @@ once -- no backpressure, no slow path.%
       Memory-bound: HLS settles on \hi{II = 4 cyc/px}.
     \end{column}
     \begin{column}{0.43\textwidth}
-      \textbf{Measured performance (1920$\times$1080):}\\[0.3em]
+      \textbf{Measured performance (1920$\times$1080, PYNQ-Z2 @100 MHz):}\\[0.3em]
       \begin{tabular}{ll}
         \toprule
-        cycles      & 8{,}294{,}489 \\
-        wall @200MHz & $\approx$ \hi{41 ms} ($\approx$ 24 fps) \\
+        cycles       & 8{,}294{,}471 \\
+        wall @100MHz & $\approx$ \hi{82.9 ms} ($\approx$ 12 fps) \\
         \bottomrule
       \end{tabular}
       \vspace{0.6em}
@@ -229,8 +229,9 @@ from two external remap tables instead of a fixed scale factor.  We
 shipped this as an intentionally simple baseline: four parallel
 \code{m\_axi} masters -- image, \code{map\_x}, \code{map\_y}, output --
 no on-chip line buffer.  HLS converges on II=4 cycles per pixel,
-bottlenecked by memory dependencies, which works out to about 41
-milliseconds for a full HD frame -- enough for 24 fps but not 60.  The
+bottlenecked by memory dependencies.  On the PYNQ-Z2 at 100\,MHz the
+csynth report measures 8.29\,M cycles, about 82.9\,ms for a full HD
+frame -- roughly 12\,fps, well under 30.  The
 path to II=1 is in our plan: line-buffer depth $D_y{+}2$ derived from
 an offline analysis of the map, an output queue that defers pixels
 until their source rows are resident, and a DDR slow-path for misses.
@@ -286,46 +287,52 @@ scaling -- all byte-exact against the golden binaries.%
 }
 
 % =====================================================================
-\begin{frame}{Results: all green, 1--3\,\% of \code{xczu7ev}}
-  \textbf{Verification (target \code{xczu7ev-ffvc1156-2-e} @ 5\,ns):}\\[0.3em]
+\begin{frame}{Results on \code{xc7z020} @ 10\,ns: functional green, resize needs clock relax}
+  \textbf{Verification:}\\[0.3em]
   \centering
   \begin{tabular}{lcccc}
     \toprule
     kernel  & py-tests & C-sim & csynth slack & co-sim \\
     \midrule
-    resize  & 5/5 & 5/5 & $-0.00$\,ns (marginal) & \hi{10/10} (5 synth + 5 NYU)\\
-    rectify & 4/4 & 5/5 & $0.00$\,ns (clean)     & 5/5 \\
+    resize  & 5/5 & 5/5 & $-0.70$\,ns (closes $\approx$93\,MHz) & \hi{10/10} (5 synth + 5 NYU)\\
+    rectify & 4/4 & 5/5 & $0.00$\,ns (clean)                    & 5/5 \\
     \bottomrule
   \end{tabular}\\[0.7em]
 
   \textbf{Resource utilisation (from \code{csynth.rpt}):}\\[0.3em]
   \begin{tabular}{lcccccc}
     \toprule
-    kernel  & BRAM & DSP & FF & LUT & \% of part & throughput \\
+    kernel  & BRAM & DSP & FF & LUT & \% of part (LUT/DSP) & throughput \\
     \midrule
-    resize  & 2  & 37 & 5{,}206 & 6{,}406 & \hi{1--2\,\%} & 1 px / cycle \\
-    rectify & 12 & 13 & 7{,}542 & 8{,}903 & \hi{1--3\,\%} & 4 cyc / px   \\
+    resize  & 2  & 37 & 4{,}852 & 8{,}699 & \hi{16\,\% / 16\,\%} & 1 px / cycle \\
+    rectify & 12 & 13 & 7{,}508 & 9{,}623 & \hi{18\,\% / 5\,\%}  & 4 cyc / px   \\
     \bottomrule
-  \end{tabular}\\[0.7em]
+  \end{tabular}\\[0.3em]
+  {\tiny For reference, on the larger \code{xczu7ev} @ 5\,ns each kernel sat
+   at 1--3\,\% on every metric -- the jump reflects \code{xc7z020}'s
+   smaller LUT/DSP budget, not a design regression.}\\[0.5em]
 
   \raggedright
-  \textbf{Takeaway:} A streaming line-buffer schedule turns resize into a
-  near-free PL block; rectify is correct \& small but memory-bound
-  until the buffered path lands.  Golden-first methodology transferred
-  cleanly from one kernel to the next.
+  \textbf{Takeaway:} Functional verification carried cleanly to PYNQ-Z2;
+  rectify meets 100\,MHz, resize needs a slightly relaxed clock
+  ($\approx$90\,MHz) on \code{xc7z020} -- a normal port adjustment.  The
+  streaming line-buffer schedule keeps resize compact; rectify is
+  memory-bound until the buffered path lands.
 \end{frame}
 \note{%
-Final numbers: every layer of verification passes for both kernels.
-Resize's top-module slack is reported as minus-zero nanoseconds at the
-5\,ns target -- that's an HLS sub-rounding flag, not a functional
-failure; cosim is clean.  Rectify meets the same 5\,ns target with no
-warning.  Resource-wise, both kernels sit under 3\% of the
-\code{xczu7ev} on every metric, which leaves plenty of headroom for
-the rest of a perception pipeline.  The takeaway: the line-buffer
-streaming schedule makes resize essentially free in the PL, rectify is
-correct and small but memory-bound until we land the buffered variant,
-and the golden-first methodology transferred from one kernel to the
-next without modification.  Happy to take questions.%
+Final numbers from the re-synthesis on \code{xc7z020} at 10\,ns:
+every functional verification layer still passes for both kernels --
+the four-layer flow doesn't depend on the part, so porting from
+\code{xczu7ev} to PYNQ-Z2 broke nothing we'd already proved.
+Resource-wise, the design is no longer 1--3\% of the part; it's
+roughly 16\% LUT for resize and 18\% LUT for rectify, because
+\code{xc7z020} is a much smaller device.  The one real issue is that
+the resize \code{EMIT\_PIXEL} pipeline reports $-0.70$\,ns of slack at
+the 10\,ns target -- it closes at about 93\,MHz, so Vivado P\&R will
+need a slightly relaxed clock for sign-off.  Rectify meets 100\,MHz
+cleanly and lands its full HD frame in about 83\,ms.  The qualitative
+takeaway holds: streaming schedule keeps resize compact, rectify
+needs the buffered variant for higher fps.  Happy to take questions.%
 }
 
 \end{document}
