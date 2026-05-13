@@ -2,6 +2,8 @@
 
 This project include two Vitis HLS image-processing kernels for the AMD ROS 2 Perception Node pipeline: bilinear `resize_kernel` and map-based `rectify_kernel`. The motivation is to **offload simple but heavy image processing computation from PS to IP**, thus allow PS to perform real-time downstream perception tasks such as object detection, SLAM, and visual odometry without being bottlenecked by per-pixel preprocessing.
 
+Project present slides: https://drive.google.com/drive/folders/1YVrzg5BBU5HWA45cEg7AhtgLawiN_6Wp?usp=drive_link
+
 The overall architechture is shown in below figure, demostrating the process for our project
 1. Initialization: 
     - Step 1: PS compute mapping for `rectify_kernel`, write to memory using AXI-Full
